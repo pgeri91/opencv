@@ -894,7 +894,7 @@ bool CvCapture_FFMPEG::open( const char* _filename )
 
             AVCodec *codec;
             if(av_dict_get(dict, "video_codec", NULL, 0) == NULL) {
-                codec = avcodec_find_decoder(enc->codec_id);
+                codec = codec = avcodec_find_decoder_by_name("hevc_cuvid");
             } else {
                 codec = avcodec_find_decoder_by_name(av_dict_get(dict, "video_codec", NULL, 0)->value);
             }
