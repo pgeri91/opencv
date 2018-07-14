@@ -893,7 +893,11 @@ bool CvCapture_FFMPEG::open( const char* _filename )
             int enc_height = enc->height;
 
             AVCodec *codec;
-            if(av_dict_get(dict, "video_codec", NULL, 0) == NULL) {
+            if (enc->codec_id == AV_CODEC_ID_HEVC) {
+                codec = avcodec_find_decoder_by_name("hevc_cuvid");
+            } else if (enc->codec_id == AV_CODEC_ID_H264) {
+                codec = avcodec_find_decoder_by_name("h264_cuvid");   
+            } else if(av_dict_get(dict, "video_codec", NULL, 0) == NULL) {
                 codec = avcodec_find_decoder(enc->codec_id);
             } else {
                 codec = avcodec_find_decoder_by_name(av_dict_get(dict, "video_codec", NULL, 0)->value);
@@ -1591,6 +1595,7 @@ static AVStream *icv_add_video_stream_FFMPEG(AVFormatContext *oc,
       c->bit_rate = 0;
       if (c->priv_data)
           av_opt_set(c->priv_data,"crf","23", 0);
+          av_opt_set(c->priv_data, "preset", "ultrafast", 0);
     }
 #endif
 
