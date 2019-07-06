@@ -916,18 +916,10 @@ bool CvCapture_FFMPEG::open( const char* _filename )
             break;
         }
     }
-    // decoder_ctx = avcodec_alloc_context3(decoder);
-    // if (decoder_ctx == NULL)
-    //     close();
-    //     return false;
-    decoder_ctx = ic->streams[video_stream]->codec;
 
     video_st = ic->streams[video_stream];
-    // if (avcodec_parameters_to_context(decoder_ctx, video->codecpar) < 0)
-    //     close();
-    //     return true;
-
-    decoder_ctx->get_format  = get_hw_format;
+    decoder_ctx = video_st->codec;
+    decoder_ctx->get_format = get_hw_format;
 
     err = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI,
                                         "/dev/dri/renderD128", NULL, 0);
