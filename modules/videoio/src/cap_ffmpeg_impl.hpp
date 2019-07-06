@@ -204,7 +204,7 @@ static
 inline void get_monotonic_time(timespec *tv)
 {
     LARGE_INTEGER           t;
-    FILETIME				f;
+    FILETIME                f;
     double                  microseconds;
     static LARGE_INTEGER    offset;
     static double           frequencyToMicroseconds;
@@ -429,6 +429,22 @@ static AVRational _opencv_ffmpeg_get_sample_aspect_ratio(AVStream *stream)
 #endif
 }
 
+static enum AVPixelFormat hw_pix_fmt;
+
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
+                                        const enum AVPixelFormat *pix_fmts)
+{
+    const enum AVPixelFormat *p;
+
+    for (p = pix_fmts; *p != -1; p++) {
+        if (*p == hw_pix_fmt)
+            return *p;
+    }
+
+    fprintf(stderr, "Failed to get HW surface format.\n");
+    return AV_PIX_FMT_NONE;
+}
+
 
 struct CvCapture_FFMPEG
 {
@@ -455,8 +471,10 @@ struct CvCapture_FFMPEG
     int64_t dts_to_frame_number(int64_t dts);
     double  dts_to_sec(int64_t dts);
 
+    AVBufferRef     *hw_device_ctx;
     AVFormatContext * ic;
-    AVCodec         * avcodec;
+    AVCodec         * decoder;
+    AVCodecContext  *decoder_ctx;
     int               video_stream;
     AVStream        * video_st;
     AVFrame         * picture;
@@ -502,7 +520,10 @@ void CvCapture_FFMPEG::init()
     av_init_packet(&packet);
     img_convert_ctx = 0;
 
-    avcodec = 0;
+    hw_device_ctx = NULL;
+    decoder = NULL;
+    decoder_ctx = NULL;
+
     frame_number = 0;
     eps_zero = 0.000025;
 
@@ -556,6 +577,10 @@ void CvCapture_FFMPEG::close()
         ic = NULL;
     }
 
+    if (hw_device_ctx != NULL) {
+        av_buffer_unref(&hw_device_ctx);
+    }
+
 #if USE_AV_FRAME_GET_BUFFER
     av_frame_unref(&rgb_picture);
 #else
@@ -576,7 +601,6 @@ void CvCapture_FFMPEG::close()
     if (dict != NULL)
        av_dict_free(&dict);
 #endif
-
     init();
 }
 
@@ -815,7 +839,8 @@ bool CvCapture_FFMPEG::open( const char* _filename )
     AutoLock lock(_mutex);
     unsigned i;
     bool valid = false;
-
+    int err, ret;
+    enum AVHWDeviceType type = AV_HWDEVICE_TYPE_VAAPI;
     close();
 
 #if USE_AV_INTERRUPT_CALLBACK
@@ -846,9 +871,9 @@ bool CvCapture_FFMPEG::open( const char* _filename )
 #else
     av_dict_set(&dict, "rtsp_transport", "tcp", 0);
 #endif
-    int err = avformat_open_input(&ic, _filename, NULL, &dict);
+    err = avformat_open_input(&ic, _filename, NULL, &dict);
 #else
-    int err = av_open_input_file(&ic, _filename, NULL, 0, NULL);
+    err = av_open_input_file(&ic, _filename, NULL, 0, NULL);
 #endif
 
     if (err < 0)
@@ -868,66 +893,65 @@ bool CvCapture_FFMPEG::open( const char* _filename )
         CV_WARN("Could not find codec parameters");
         goto exit_func;
     }
-    for(i = 0; i < ic->nb_streams; i++)
-    {
-#if LIBAVFORMAT_BUILD > 4628
-        AVCodecContext *enc = ic->streams[i]->codec;
-#else
-        AVCodecContext *enc = &ic->streams[i]->codec;
-#endif
+    decoder = avcodec_find_decoder_by_name("h264_vaapi");
+    /* find the video stream information */
+    ret = av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
+    if (ret < 0) {
+        fprintf(stderr, "Cannot find a video stream in the input file\n");
+        goto exit_func;
+    }
+    video_stream = ret;
 
-//#ifdef FF_API_THREAD_INIT
-//        avcodec_thread_init(enc, get_number_of_cpus());
-//#else
-        enc->thread_count = get_number_of_cpus();
-//#endif
-
-#if LIBAVFORMAT_BUILD < CALC_FFMPEG_VERSION(53, 2, 0)
-#define AVMEDIA_TYPE_VIDEO CODEC_TYPE_VIDEO
-#endif
-
-        if( AVMEDIA_TYPE_VIDEO == enc->codec_type && video_stream < 0)
-        {
-            // backup encoder' width/height
-            int enc_width = enc->width;
-            int enc_height = enc->height;
-
-            AVCodec *codec;
-            if(av_dict_get(dict, "video_codec", NULL, 0) == NULL) {
-                codec = avcodec_find_decoder(enc->codec_id);
-            } else {
-                codec = avcodec_find_decoder_by_name(av_dict_get(dict, "video_codec", NULL, 0)->value);
-            }
-            if (!codec ||
-#if LIBAVCODEC_VERSION_INT >= ((53<<16)+(8<<8)+0)
-                avcodec_open2(enc, codec, NULL)
-#else
-                avcodec_open(enc, codec)
-#endif
-                < 0)
-                goto exit_func;
-
-            // checking width/height (since decoder can sometimes alter it, eg. vp6f)
-            if (enc_width && (enc->width != enc_width)) { enc->width = enc_width; }
-            if (enc_height && (enc->height != enc_height)) { enc->height = enc_height; }
-
-            video_stream = i;
-            video_st = ic->streams[i];
-#if LIBAVCODEC_BUILD >= (LIBAVCODEC_VERSION_MICRO >= 100 \
-    ? CALC_FFMPEG_VERSION(55, 45, 101) : CALC_FFMPEG_VERSION(55, 28, 1))
-            picture = av_frame_alloc();
-#else
-            picture = avcodec_alloc_frame();
-#endif
-
-            frame.width = enc->width;
-            frame.height = enc->height;
-            frame.cn = 3;
-            frame.step = 0;
-            frame.data = NULL;
+    for (i = 0;; i++) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, i);
+        if (!config) {
+            fflush(stdout);
+            fprintf(stderr, "Decoder %s does not support device type %s.\n",
+                    decoder->name, av_hwdevice_get_type_name(type));
+            goto exit_func;
+        }
+        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+            config->device_type == type) {
+            hw_pix_fmt = config->pix_fmt;
             break;
         }
     }
+    // decoder_ctx = avcodec_alloc_context3(decoder);
+    // if (decoder_ctx == NULL)
+    //     close();
+    //     return false;
+    decoder_ctx = ic->streams[video_stream]->codec;
+
+    video_st = ic->streams[video_stream];
+    // if (avcodec_parameters_to_context(decoder_ctx, video->codecpar) < 0)
+    //     close();
+    //     return true;
+
+    decoder_ctx->get_format  = get_hw_format;
+
+    err = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI,
+                                        "/dev/dri/renderD128", NULL, 0);
+    if (err < 0) {
+        fprintf(stderr, "Failed to create specified HW device.\n");
+        goto exit_func;
+    }
+    decoder_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+
+
+
+    if ((ret = avcodec_open2(decoder_ctx, decoder, NULL)) < 0) {
+        fprintf(stderr, "Failed to open codec for stream #%u\n", video_stream);
+        goto exit_func;
+    }
+
+    picture = av_frame_alloc();
+    picture->format = AV_PIX_FMT_NV12;
+
+    frame.width = decoder_ctx->width;
+    frame.height = decoder_ctx->height;
+    frame.cn = 3;
+    frame.step = 0;
+    frame.data = NULL;
 
     if(video_stream >= 0) valid = true;
 
@@ -966,7 +990,6 @@ bool CvCapture_FFMPEG::grabFrame()
     get_monotonic_time(&interrupt_metadata.value);
     interrupt_metadata.timeout_after_ms = LIBAVFORMAT_INTERRUPT_READ_TIMEOUT_MS;
 #endif
-
     // get the next frame
     while (!valid)
     {
@@ -982,31 +1005,45 @@ bool CvCapture_FFMPEG::grabFrame()
 #endif
 
         int ret = av_read_frame(ic, &packet);
-        if (ret == AVERROR(EAGAIN)) continue;
+        if (ret == AVERROR(EAGAIN)) {
+            fprintf(stderr, "av_read_frame failed\n");
+            continue;
+        }
 
         /* else if (ret < 0) break; */
 
         if( packet.stream_index != video_stream )
         {
+            fprintf(stderr, "packet.stream_index != video_stream\n");
             _opencv_ffmpeg_av_packet_unref (&packet);
             count_errs++;
             if (count_errs > max_number_of_attempts)
                 break;
             continue;
         }
-
         // Decode video frame
-        #if LIBAVFORMAT_BUILD >= CALC_FFMPEG_VERSION(53, 2, 0)
-            avcodec_decode_video2(video_st->codec, picture, &got_picture, &packet);
-        #elif LIBAVFORMAT_BUILD > 4628
-                avcodec_decode_video(video_st->codec,
-                                     picture, &got_picture,
-                                     packet.data, packet.size);
-        #else
-                avcodec_decode_video(&video_st->codec,
-                                     picture, &got_picture,
-                                     packet.data, packet.size);
-        #endif
+        ret = avcodec_send_packet(video_st->codec, &packet);
+        if (ret < 0) {
+            fprintf(stderr, "Error during decoding\n");
+            return false;
+        }
+        AVFrame *hw_picture = NULL;
+        hw_picture = av_frame_alloc();
+        ret = avcodec_receive_frame(video_st->codec, hw_picture);
+        if (ret < 0) {
+            fprintf(stderr, "Error while decoding\n");
+            return false;
+        }
+
+        if (hw_picture->format == hw_pix_fmt) {
+            if ((ret = av_hwframe_transfer_data(picture, hw_picture, 0)) < 0) {
+                fprintf(stderr, "Error transferring the data to system memory\n");
+                return false;
+            } else {
+                av_frame_free(&hw_picture);
+                got_picture = true;
+            }
+        }
 
         // Did we get a video frame?
         if(got_picture)
@@ -1020,11 +1057,14 @@ bool CvCapture_FFMPEG::grabFrame()
         }
         else
         {
+            fprintf(stderr, "didn't get frame\n");
             count_errs++;
             if (count_errs > max_number_of_attempts)
                 break;
         }
     }
+
+    
 
     if( valid && first_frame_number < 0 )
         first_frame_number = dts_to_frame_number(picture_pts);
@@ -1041,8 +1081,10 @@ bool CvCapture_FFMPEG::grabFrame()
 
 bool CvCapture_FFMPEG::retrieveFrame(int, unsigned char** data, int* step, int* width, int* height, int* cn)
 {
-    if( !video_st || !picture->data[0] )
+    if( !video_st || !picture->data[0] ) {
+        fprintf(stderr, "no picture data\n");
         return false;
+    }
 
     if( img_convert_ctx == NULL ||
         frame.width != video_st->codec->width ||
@@ -1056,7 +1098,7 @@ bool CvCapture_FFMPEG::retrieveFrame(int, unsigned char** data, int* step, int* 
         img_convert_ctx = sws_getCachedContext(
                 img_convert_ctx,
                 buffer_width, buffer_height,
-                video_st->codec->pix_fmt,
+                AV_PIX_FMT_NV12,
                 buffer_width, buffer_height,
                 AV_PIX_FMT_BGR24,
                 SWS_BICUBIC,
@@ -1065,7 +1107,7 @@ bool CvCapture_FFMPEG::retrieveFrame(int, unsigned char** data, int* step, int* 
 
         if (img_convert_ctx == NULL)
             return false;//CV_Error(0, "Cannot initialize the conversion context!");
-
+        
 #if USE_AV_FRAME_GET_BUFFER
         av_frame_unref(&rgb_picture);
         rgb_picture.format = AV_PIX_FMT_BGR24;
@@ -1106,7 +1148,6 @@ bool CvCapture_FFMPEG::retrieveFrame(int, unsigned char** data, int* step, int* 
     *width = frame.width;
     *height = frame.height;
     *cn = frame.cn;
-
     return true;
 }
 
@@ -1591,6 +1632,7 @@ static AVStream *icv_add_video_stream_FFMPEG(AVFormatContext *oc,
       c->bit_rate = 0;
       if (c->priv_data)
           av_opt_set(c->priv_data,"crf","23", 0);
+          av_opt_set(c->priv_data, "preset", "ultrafast", 0);
     }
 #endif
 
