@@ -478,6 +478,7 @@ struct CvCapture_FFMPEG
     int               video_stream;
     AVStream        * video_st;
     AVFrame         * picture;
+    AVFrame         * hw_picture;
     AVFrame           rgb_picture;
     int64_t           picture_pts;
 
@@ -511,6 +512,7 @@ void CvCapture_FFMPEG::init()
     video_stream = -1;
     video_st = 0;
     picture = 0;
+    hw_picture = 0;
     picture_pts = AV_NOPTS_VALUE_;
     first_frame_number = -1;
     memset( &rgb_picture, 0, sizeof(rgb_picture) );
@@ -554,6 +556,9 @@ void CvCapture_FFMPEG::close()
 #endif
     }
 
+    if ( hw_picture)
+        av_frame_free(&hw_picture);
+
     if( video_st )
     {
 #if LIBAVFORMAT_BUILD > 4628
@@ -577,9 +582,12 @@ void CvCapture_FFMPEG::close()
         ic = NULL;
     }
 
-    if (hw_device_ctx != NULL) {
+
+    if (decoder_ctx != NULL)
+        avcodec_free_context(&decoder_ctx);
+
+    if (hw_device_ctx != NULL)
         av_buffer_unref(&hw_device_ctx);
-    }
 
 #if USE_AV_FRAME_GET_BUFFER
     av_frame_unref(&rgb_picture);
@@ -939,6 +947,8 @@ bool CvCapture_FFMPEG::open( const char* _filename )
     picture = av_frame_alloc();
     picture->format = AV_PIX_FMT_NV12;
 
+    hw_picture = av_frame_alloc();
+
     frame.width = decoder_ctx->width;
     frame.height = decoder_ctx->height;
     frame.cn = 3;
@@ -1016,23 +1026,32 @@ bool CvCapture_FFMPEG::grabFrame()
         // Decode video frame
         ret = avcodec_send_packet(video_st->codec, &packet);
         if (ret < 0) {
-            fprintf(stderr, "Error during decoding\n");
-            return false;
+            count_errs++;
+            if (count_errs > max_number_of_attempts)
+                break;
+            continue;
         }
-        AVFrame *hw_picture = NULL;
-        hw_picture = av_frame_alloc();
+
         ret = avcodec_receive_frame(video_st->codec, hw_picture);
         if (ret < 0) {
+            if (ret == AVERROR(EAGAIN)) {
+                fprintf(stderr, "Error while decoding - output is not available in this state - user must try to send new input\n");
+            }
             fprintf(stderr, "Error while decoding\n");
-            return false;
+            count_errs++;
+            if (count_errs > max_number_of_attempts)
+                break;
+            continue;
         }
 
         if (hw_picture->format == hw_pix_fmt) {
             if ((ret = av_hwframe_transfer_data(picture, hw_picture, 0)) < 0) {
                 fprintf(stderr, "Error transferring the data to system memory\n");
-                return false;
+                count_errs++;
+                if (count_errs > max_number_of_attempts)
+                    break;
+                continue;
             } else {
-                av_frame_free(&hw_picture);
                 got_picture = true;
             }
         }
