@@ -544,20 +544,16 @@ void CvCapture_FFMPEG::close()
     }
 
     if( picture )
-    {
-#if LIBAVCODEC_BUILD >= (LIBAVCODEC_VERSION_MICRO >= 100 \
-    ? CALC_FFMPEG_VERSION(55, 45, 101) : CALC_FFMPEG_VERSION(55, 28, 1))
-        av_frame_free(&picture);
-#elif LIBAVCODEC_BUILD >= (LIBAVCODEC_VERSION_MICRO >= 100 \
-    ? CALC_FFMPEG_VERSION(54, 59, 100) : CALC_FFMPEG_VERSION(54, 28, 0))
-        avcodec_free_frame(&picture);
-#else
         av_free(picture);
-#endif
-    }
 
     if ( hw_picture)
         av_frame_free(&hw_picture);
+
+    // free last packet if exist
+    if (packet.data) {
+        _opencv_ffmpeg_av_packet_unref (&packet);
+        packet.data = NULL;
+    }
 
     if( video_st )
     {
@@ -571,23 +567,20 @@ void CvCapture_FFMPEG::close()
         video_st = NULL;
     }
 
+
     if( ic )
     {
-#if LIBAVFORMAT_BUILD < CALC_FFMPEG_VERSION(53, 24, 2)
-        av_close_input_file(ic);
-#else
         avformat_close_input(&ic);
-#endif
-
         ic = NULL;
+        decoder_ctx = NULL;
     }
 
 
-    if (decoder_ctx != NULL)
-        avcodec_free_context(&decoder_ctx);
-
-    if (hw_device_ctx != NULL)
+    if (hw_device_ctx != NULL) {
         av_buffer_unref(&hw_device_ctx);
+        hw_device_ctx = NULL; 
+    }
+        
 
 #if USE_AV_FRAME_GET_BUFFER
     av_frame_unref(&rgb_picture);
@@ -599,11 +592,7 @@ void CvCapture_FFMPEG::close()
     }
 #endif
 
-    // free last packet if exist
-    if (packet.data) {
-        _opencv_ffmpeg_av_packet_unref (&packet);
-        packet.data = NULL;
-    }
+
 
 #if LIBAVFORMAT_BUILD >= CALC_FFMPEG_VERSION(52, 111, 0)
     if (dict != NULL)
